@@ -1,0 +1,8 @@
+[project]
+  subdomain = "nexcar-fzmj315z"
+
+[agent]
+  id = "CA_toxu96WhuhH8"
+  cpu = "1000m"
+  replicas = 0
+  max_replicas = 1

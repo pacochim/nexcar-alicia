@@ -1,4 +1,9 @@
 livekit>=1.0
-livekit-agents[openai,deepgram,cartesia,silero,turn_detector]~=1.0
+livekit-agents~=1.0
+livekit-plugins-openai~=1.0
+livekit-plugins-deepgram~=1.0
+livekit-plugins-cartesia~=1.0
+livekit-plugins-silero~=1.0
+livekit-plugins-turn-detector~=1.0
 livekit-plugins-noise-cancellation~=0.2
 python-dotenv~=1.0

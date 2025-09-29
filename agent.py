@@ -31,34 +31,44 @@ from livekit.plugins.turn_detector import english
 
 # load environment variables, this is optional, only used for local development
 load_dotenv(dotenv_path=".env.local")
-logger = logging.getLogger("outbound-caller")
+logger = logging.getLogger("invoice-validation-agent")
 logger.setLevel(logging.INFO)
 
 outbound_trunk_id = os.getenv("SIP_OUTBOUND_TRUNK_ID")
 
 
-class OutboundCaller(Agent):
+class InvoiceValidationAgent(Agent):
     def __init__(
         self,
         *,
-        name: str,
-        appointment_time: str,
-        dial_info: dict[str, Any],
+        dealership_name: str,
+        invoice_number: str,
+        customer_name: str,
+        vin: str,
+        needs_email: bool,
+        metadata: dict[str, Any],
     ):
         super().__init__(
             instructions=f"""
-            You are a scheduling assistant for a dental practice. Your interface with user will be voice.
-            You will be on a call with a patient who has an upcoming appointment. Your goal is to confirm the appointment details.
-            As a customer service representative, you will be polite and professional at all times. Allow user to end the conversation.
+            You are Alicia, a professional and courteous representative from Nexcar Financiera calling in Spanish.
+            You are calling {dealership_name} to verify invoice information.
 
-            When the user would like to be transferred to a human agent, first confirm with them. upon confirmation, use the transfer_call tool.
-            The customer's name is {name}. His appointment is on {appointment_time}.
+            Invoice Details:
+            - Invoice Number: {invoice_number}
+            - Customer Name: {customer_name}
+            - VIN: {vin}
+
+            Your primary goal: {"Collect the dealership's email address to send the validation request." if needs_email else "Verify the invoice details with the dealership."}
+
+            Be polite, professional, and brief. If they need to transfer you to someone else, politely wait.
+            If you successfully collect the email or verify the information, use the collect_email tool to save it.
+            Allow the dealership representative to end the conversation naturally.
             """
         )
         # keep reference to the participant for transfers
         self.participant: rtc.RemoteParticipant | None = None
-
-        self.dial_info = dial_info
+        self.metadata = metadata
+        self.needs_email = needs_email
 
     def set_participant(self, participant: rtc.RemoteParticipant):
         self.participant = participant
@@ -74,37 +84,50 @@ class OutboundCaller(Agent):
         )
 
     @function_tool()
-    async def transfer_call(self, ctx: RunContext):
-        """Transfer the call to a human agent, called after confirming with the user"""
+    async def collect_email(
+        self,
+        ctx: RunContext,
+        email: str,
+    ):
+        """Called when the dealership provides their email address for invoice validation.
 
-        transfer_to = self.dial_info["transfer_to"]
-        if not transfer_to:
-            return "cannot transfer call"
+        Args:
+            email: The email address provided by the dealership
+        """
+        logger.info(f"Email collected from {self.participant.identity}: {email}")
 
-        logger.info(f"transferring call to {transfer_to}")
+        # Store the collected email in metadata for later processing
+        validation_id = self.metadata.get("validationId")
+        dealership_id = self.metadata.get("dealershipId")
 
-        # let the message play fully before transferring
-        await ctx.session.generate_reply(
-            instructions="let the user know you'll be transferring them"
-        )
+        logger.info(f"Collected email for validation {validation_id}, dealership {dealership_id}")
 
-        job_ctx = get_job_context()
+        # Call the backend to save the email
+        import os
+        import json
         try:
-            await job_ctx.api.sip.transfer_sip_participant(
-                api.TransferSIPParticipantRequest(
-                    room_name=job_ctx.room.name,
-                    participant_identity=self.participant.identity,
-                    transfer_to=f"tel:{transfer_to}",
-                )
+            base_url = os.getenv("BACKEND_URL", "http://localhost:3000")
+            import urllib.request
+
+            data = json.dumps({
+                "validationId": validation_id,
+                "email": email,
+                "additionalData": {}
+            }).encode('utf-8')
+
+            req = urllib.request.Request(
+                f"{base_url}/api/validation-info-collected",
+                data=data,
+                headers={'Content-Type': 'application/json'}
             )
 
-            logger.info(f"transferred call to {transfer_to}")
+            with urllib.request.urlopen(req) as response:
+                logger.info(f"Email saved successfully: {response.status}")
+
         except Exception as e:
-            logger.error(f"error transferring call: {e}")
-            await ctx.session.generate_reply(
-                instructions="there was an error transferring the call."
-            )
-            await self.hangup()
+            logger.error(f"Error saving email to backend: {e}")
+
+        return f"Email {email} has been recorded. Thank you!"
 
     @function_tool()
     async def end_call(self, ctx: RunContext):
@@ -119,42 +142,26 @@ class OutboundCaller(Agent):
         await self.hangup()
 
     @function_tool()
-    async def look_up_availability(
+    async def confirm_invoice_details(
         self,
         ctx: RunContext,
-        date: str,
+        confirmed: bool,
+        notes: str = "",
     ):
-        """Called when the user asks about alternative appointment availability
+        """Called when the dealership confirms or denies the invoice details.
 
         Args:
-            date: The date of the appointment to check availability for
+            confirmed: True if dealership confirms the invoice is valid, False otherwise
+            notes: Any additional notes or comments from the dealership
         """
         logger.info(
-            f"looking up availability for {self.participant.identity} on {date}"
+            f"Invoice confirmation from {self.participant.identity}: {confirmed}, notes: {notes}"
         )
-        await asyncio.sleep(3)
-        return {
-            "available_times": ["1pm", "2pm", "3pm"],
-        }
 
-    @function_tool()
-    async def confirm_appointment(
-        self,
-        ctx: RunContext,
-        date: str,
-        time: str,
-    ):
-        """Called when the user confirms their appointment on a specific date.
-        Use this tool only when they are certain about the date and time.
+        validation_id = self.metadata.get("validationId")
+        logger.info(f"Invoice details confirmed for validation {validation_id}")
 
-        Args:
-            date: The date of the appointment
-            time: The time of the appointment
-        """
-        logger.info(
-            f"confirming appointment for {self.participant.identity} on {date} at {time}"
-        )
-        return "reservation confirmed"
+        return f"Thank you for {'confirming' if confirmed else 'providing feedback on'} the invoice details."
 
     @function_tool()
     async def detected_answering_machine(self, ctx: RunContext):
@@ -167,18 +174,30 @@ async def entrypoint(ctx: JobContext):
     logger.info(f"connecting to room {ctx.room.name}")
     await ctx.connect()
 
-    # when dispatching the agent, we'll pass it the approriate info to dial the user
-    # dial_info is a dict with the following keys:
-    # - phone_number: the phone number to dial
-    # - transfer_to: the phone number to transfer the call to when requested
-    dial_info = json.loads(ctx.job.metadata)
-    participant_identity = phone_number = dial_info["phone_number"]
+    # Parse the metadata sent from the frontend
+    # Metadata includes: validationId, dealershipId, requestId, invoiceData, phoneNumber, needsEmail
+    metadata = json.loads(ctx.job.metadata)
+    logger.info(f"Received metadata: {metadata}")
 
-    # look up the user's phone number and appointment details
-    agent = OutboundCaller(
-        name="Jayden",
-        appointment_time="next Tuesday at 3pm",
-        dial_info=dial_info,
+    phone_number = metadata.get("phoneNumber")
+    participant_identity = f"dealership-{metadata.get('dealershipId', 'unknown')}"
+
+    # Extract invoice data
+    invoice_data = metadata.get("invoiceData", {})
+    dealership_name = invoice_data.get("dealershipName", "Unknown Dealership")
+    invoice_number = invoice_data.get("invoiceNumber", "N/A")
+    customer_name = invoice_data.get("customerName", "Unknown Customer")
+    vin = invoice_data.get("vin", "N/A")
+    needs_email = metadata.get("needsEmail", True)
+
+    # Create the invoice validation agent with actual metadata
+    agent = InvoiceValidationAgent(
+        dealership_name=dealership_name,
+        invoice_number=invoice_number,
+        customer_name=customer_name,
+        vin=vin,
+        needs_email=needs_email,
+        metadata=metadata,
     )
 
     # the following uses GPT-4o, Deepgram and Cartesia

@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 import json
 import os
 from typing import Any
+from datetime import datetime
 
 from livekit import rtc, api
 from livekit.agents import (
@@ -27,6 +28,7 @@ from livekit.plugins import (
     noise_cancellation,# noqa: F401
 )
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from supabase import create_client, Client
 
 
 
@@ -36,6 +38,11 @@ logger = logging.getLogger("invoice-validation-agent")
 logger.setLevel(logging.INFO)
 
 outbound_trunk_id = os.getenv("SIP_OUTBOUND_TRUNK_ID")
+
+# Initialize Supabase client
+supabase_url = os.getenv("SUPABASE_URL")
+supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+supabase: Client = create_client(supabase_url, supabase_key) if supabase_url and supabase_key else None
 
 
 class InvoiceValidationAgent(Agent):
@@ -177,35 +184,8 @@ class InvoiceValidationAgent(Agent):
         logger.info(f"Email collected from {self.participant.identity}: {email}")
 
         # Store the collected email in metadata for later processing
-        validation_id = self.metadata.get("validationId")
-        dealership_id = self.metadata.get("dealershipId")
-
-        logger.info(f"Collected email for validation {validation_id}, dealership {dealership_id}")
-
-        # Call the backend to save the email
-        import os
-        import json
-        try:
-            base_url = os.getenv("BACKEND_URL", "http://localhost:3000")
-            import urllib.request
-
-            data = json.dumps({
-                "validationId": validation_id,
-                "email": email,
-                "additionalData": {}
-            }).encode('utf-8')
-
-            req = urllib.request.Request(
-                f"{base_url}/api/validation-info-collected",
-                data=data,
-                headers={'Content-Type': 'application/json'}
-            )
-
-            with urllib.request.urlopen(req) as response:
-                logger.info(f"Email saved successfully: {response.status}")
-
-        except Exception as e:
-            logger.error(f"Error saving email to backend: {e}")
+        # This will be saved to the database at the end of the call
+        self.metadata["collectedEmail"] = email
 
         return f"El correo electrónico {email} ha sido registrado exitosamente. ¡Muchas gracias por su colaboración!"
 
@@ -248,6 +228,71 @@ class InvoiceValidationAgent(Agent):
         """Called when the call reaches voicemail. Use this tool AFTER you hear the voicemail greeting"""
         logger.info(f"detected answering machine for {self.participant.identity}")
         await self.hangup()
+
+
+async def save_call_transcript(session: AgentSession, metadata: dict, room_name: str):
+    """Save the call transcript to the database after call ends and trigger next steps"""
+    try:
+        if not supabase:
+            logger.error("Supabase client not initialized")
+            return
+
+        # Get the full transcript from the session
+        # The session stores all conversation messages
+        transcript_parts = []
+
+        # Get chat context which contains the conversation history
+        if hasattr(session, 'chat_ctx') and session.chat_ctx:
+            for msg in session.chat_ctx.messages:
+                role = "Agent" if msg.role == "assistant" else "Dealership"
+                content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                transcript_parts.append(f"{role}: {content}")
+
+        full_transcript = "\n".join(transcript_parts)
+
+        logger.info(f"Saving transcript for room {room_name}: {len(full_transcript)} characters")
+
+        validation_id = metadata.get("validationId")
+        dealership_id = metadata.get("dealershipId")
+        collected_email = metadata.get("collectedEmail")
+
+        # Calculate call duration if we have start time
+        call_ended_at = datetime.utcnow().isoformat()
+
+        # Insert call record into database
+        call_data = {
+            "validation_id": validation_id,
+            "dealership_id": dealership_id,
+            "room_name": room_name,
+            "full_transcript": full_transcript,
+            "call_ended_at": call_ended_at,
+            "email_collected": collected_email,
+            "call_outcome": "success" if collected_email else "no_email",
+        }
+
+        result = supabase.table("calls").insert(call_data).execute()
+
+        if result.data:
+            logger.info(f"✅ Call transcript saved successfully: {result.data[0]['id']}")
+
+            # Process based on whether email was collected
+            if collected_email:
+                # Update validation with collected email
+                update_result = supabase.table("validations").update({
+                    "agency_email": collected_email,
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("id", validation_id).execute()
+
+                if update_result.data:
+                    logger.info(f"✅ Validation updated with email: {collected_email}")
+            else:
+                # No email collected - just log it
+                logger.info("⚠️ No email collected during call")
+        else:
+            logger.error("Failed to save call transcript")
+
+    except Exception as e:
+        logger.error(f"❌ Error saving call transcript: {e}")
 
 
 async def entrypoint(ctx: JobContext):
@@ -333,6 +378,16 @@ async def entrypoint(ctx: JobContext):
     # For outbound calls, wait for recipient to speak first
     # Agent will automatically respond after recipient's turn ends
     # (Do NOT call generate_reply for outbound calls)
+
+    # Wait for the session to end, then save the transcript
+    try:
+        await session.aclose()
+    except Exception as e:
+        logger.error(f"Session error: {e}")
+    finally:
+        # Save transcript after call ends
+        logger.info("Call ended, saving transcript...")
+        await save_call_transcript(session, metadata, ctx.room.name)
 
 
 if __name__ == "__main__":

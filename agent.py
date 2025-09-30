@@ -26,7 +26,8 @@ from livekit.plugins import (
     silero,
     noise_cancellation,# noqa: F401
 )
-from livekit.plugins.turn_detector import english
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
 
 
 # load environment variables, this is optional, only used for local development
@@ -50,8 +51,8 @@ class InvoiceValidationAgent(Agent):
     ):
         super().__init__(
             instructions=f"""
-            You are Alicia, a professional and courteous representative from Nexcar Financiera calling in Spanish.
-            You are calling {dealership_name} to verify invoice information.
+            YOU ONLY SPEAKS IN SPANISH, You are Alicia, a professional and courteous representative from Nexcar Financiera calling in Spanish.
+            You are calling {dealership_name} to verify invoice information. 
 
             Invoice Details:
             - Invoice Number: {invoice_number}
@@ -62,7 +63,7 @@ class InvoiceValidationAgent(Agent):
 
             Be polite, professional, and brief. If they need to transfer you to someone else, politely wait.
             If you successfully collect the email or verify the information, use the collect_email tool to save it.
-            Allow the dealership representative to end the conversation naturally.
+            Allow the dealership representative to end the conversation naturally, any number or serial number tell it slowly so the people can understand you.
             """
         )
         # keep reference to the participant for transfers
@@ -229,11 +230,11 @@ async def entrypoint(ctx: JobContext):
 
     # Step 4: Start agent session (after SIP participant is connected)
     session = AgentSession(
-        turn_detection=english.EnglishModel(),
+        turn_detection=MultilingualModel(),
         vad=silero.VAD.load(),
-        stt=deepgram.STT(),
-        tts=cartesia.TTS(),
-        llm=openai.LLM(model="gpt-4o"),
+        stt=openai.STT(model="gpt-4o-mini-transcribe"),
+        tts=cartesia.TTS(model="sonic-2", voice="5c5ad5e7-1020-476b-8b91-fdcbe9cc313c"),
+        llm=openai.LLM(model="gemini-2.5-pro"),
     )
 
     await session.start(

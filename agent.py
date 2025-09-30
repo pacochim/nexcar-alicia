@@ -171,8 +171,7 @@ class InvoiceValidationAgent(Agent):
 
 
 async def entrypoint(ctx: JobContext):
-    logger.info(f"connecting to room {ctx.room.name}")
-    await ctx.connect()
+    logger.info(f"Starting agent for room {ctx.room.name}")
 
     # Parse the metadata sent from the frontend
     # Metadata includes: validationId, dealershipId, requestId, invoiceData, phoneNumber, needsEmail
@@ -190,7 +189,35 @@ async def entrypoint(ctx: JobContext):
     vin = invoice_data.get("vin", "N/A")
     needs_email = metadata.get("needsEmail", True)
 
-    # Create the invoice validation agent with actual metadata
+    # Step 1: Connect to the room (as per LiveKit docs)
+    logger.info("Connecting to room...")
+    await ctx.connect()
+
+    # Step 2: Place outbound call (if phone number provided)
+    if phone_number is not None:
+        logger.info(f"Placing outbound call to {phone_number}...")
+        try:
+            await ctx.api.sip.create_sip_participant(
+                api.CreateSIPParticipantRequest(
+                    room_name=ctx.room.name,
+                    sip_trunk_id=outbound_trunk_id,
+                    sip_call_to=phone_number,
+                    participant_identity=participant_identity,
+                    # function blocks until user answers the call, or if the call fails
+                    wait_until_answered=True,
+                )
+            )
+            logger.info("Call answered successfully")
+        except api.TwirpError as e:
+            logger.error(
+                f"error creating SIP participant: {e.message}, "
+                f"SIP status: {e.metadata.get('sip_status_code')} "
+                f"{e.metadata.get('sip_status')}"
+            )
+            ctx.shutdown()
+            return
+
+    # Step 3: Create the invoice validation agent with actual metadata
     agent = InvoiceValidationAgent(
         dealership_name=dealership_name,
         invoice_number=invoice_number,
@@ -200,58 +227,32 @@ async def entrypoint(ctx: JobContext):
         metadata=metadata,
     )
 
-    # the following uses GPT-4o, Deepgram and Cartesia
+    # Step 4: Start agent session (after SIP participant is connected)
     session = AgentSession(
         turn_detection=english.EnglishModel(),
         vad=silero.VAD.load(),
         stt=deepgram.STT(),
-        # you can also use OpenAI's TTS with openai.TTS()
         tts=cartesia.TTS(),
         llm=openai.LLM(model="gpt-4o"),
-        # you can also use a speech-to-speech model like OpenAI's Realtime API
-        # llm=openai.realtime.RealtimeModel()
     )
 
-    # start the session first before dialing, to ensure that when the user picks up
-    # the agent does not miss anything the user says
-    session_started = asyncio.create_task(
-        session.start(
-            agent=agent,
-            room=ctx.room,
-            room_input_options=RoomInputOptions(
-                # enable Krisp background voice and noise removal
-                noise_cancellation=noise_cancellation.BVCTelephony(),
-            ),
-        )
+    await session.start(
+        agent=agent,
+        room=ctx.room,
+        room_input_options=RoomInputOptions(
+            # enable Krisp background voice and noise removal
+            noise_cancellation=noise_cancellation.BVCTelephony(),
+        ),
     )
 
-    # `create_sip_participant` starts dialing the user
-    try:
-        await ctx.api.sip.create_sip_participant(
-            api.CreateSIPParticipantRequest(
-                room_name=ctx.room.name,
-                sip_trunk_id=outbound_trunk_id,
-                sip_call_to=phone_number,
-                participant_identity=participant_identity,
-                # function blocks until user answers the call, or if the call fails
-                wait_until_answered=True,
-            )
-        )
+    # Wait for participant to fully join
+    participant = await ctx.wait_for_participant(identity=participant_identity)
+    logger.info(f"participant joined: {participant.identity}")
+    agent.set_participant(participant)
 
-        # wait for the agent session start and participant join
-        await session_started
-        participant = await ctx.wait_for_participant(identity=participant_identity)
-        logger.info(f"participant joined: {participant.identity}")
-
-        agent.set_participant(participant)
-
-    except api.TwirpError as e:
-        logger.error(
-            f"error creating SIP participant: {e.message}, "
-            f"SIP status: {e.metadata.get('sip_status_code')} "
-            f"{e.metadata.get('sip_status')}"
-        )
-        ctx.shutdown()
+    # For outbound calls, wait for recipient to speak first
+    # Agent will automatically respond after recipient's turn ends
+    # (Do NOT call generate_reply for outbound calls)
 
 
 if __name__ == "__main__":

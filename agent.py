@@ -20,7 +20,7 @@ from livekit.agents import (
     RoomInputOptions,
 )
 from livekit.plugins import (
-    deepgram,
+    google,
     openai,
     cartesia,
     silero,
@@ -234,7 +234,7 @@ async def entrypoint(ctx: JobContext):
         vad=silero.VAD.load(),
         stt=openai.STT(model="gpt-4o-mini-transcribe"),
         tts=cartesia.TTS(model="sonic-2", voice="5c5ad5e7-1020-476b-8b91-fdcbe9cc313c"),
-        llm=openai.LLM(model="gemini-2.0-flash"),
+        llm=google.LLM(model="gemini-2.0-flash"),
     )
 
     await session.start(

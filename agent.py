@@ -234,7 +234,7 @@ async def entrypoint(ctx: JobContext):
         vad=silero.VAD.load(),
         stt=openai.STT(model="gpt-4o-mini-transcribe"),
         tts=cartesia.TTS(model="sonic-2", voice="5c5ad5e7-1020-476b-8b91-fdcbe9cc313c"),
-        llm=google.LLM(model="gemini-2.0-flash"),
+        llm=google.LLM(model="gemini-2.0-flash-exp",),
     )
 
     await session.start(

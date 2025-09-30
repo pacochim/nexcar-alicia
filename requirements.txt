@@ -7,3 +7,4 @@ livekit-plugins-silero~=1.2
 livekit-plugins-turn-detector~=1.2
 livekit-plugins-noise-cancellation~=0.2
 python-dotenv~=1.0
+supabase~=2.0

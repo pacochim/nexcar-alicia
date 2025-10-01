@@ -5,8 +5,10 @@ import logging
 from dotenv import load_dotenv
 import json
 import os
-from typing import Any
+import time
+from typing import Any, Optional, Annotated
 from datetime import datetime
+from dataclasses import dataclass, field
 
 from livekit import rtc, api
 from livekit.agents import (
@@ -19,6 +21,7 @@ from livekit.agents import (
     cli,
     WorkerOptions,
     RoomInputOptions,
+    stt,
 )
 from livekit.plugins import (
     google,
@@ -45,6 +48,14 @@ supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 supabase: Client = create_client(supabase_url, supabase_key) if supabase_url and supabase_key else None
 
 
+@dataclass
+class UserData:
+    """User data to track DTMF interactions and transcripts"""
+    last_dtmf_press: float = 0
+    transcript_parts: list = field(default_factory=list)
+    egress_id: Optional[str] = None
+
+
 class InvoiceValidationAgent(Agent):
     def __init__(
         self,
@@ -59,6 +70,15 @@ class InvoiceValidationAgent(Agent):
         super().__init__(
             instructions=f"""
             IMPORTANTE: HABLAS ÚNICAMENTE EN ESPAÑOL. Eres Alicia, representante profesional y cortés de Nexcar Financiera.
+
+            NAVEGACIÓN DE MENÚS IVR (SISTEMAS AUTOMÁTICOS):
+            - Si escuchas un menú automático con opciones (presione 1 para ventas, presione 2 para...), usa la herramienta send_dtmf_code
+            - Escucha cuidadosamente todas las opciones antes de decidir
+            - Busca opciones relacionadas con: ventas, facturación, administración, contabilidad
+            - Si no hay opción específica, elige la opción para "hablar con un representante" u "operadora"
+            - NUNCA menciones que estás presionando botones - simplemente hazlo
+            - Después de presionar una opción, espera pacientemente a que se complete la transferencia
+            - Si te vuelven a presentar otro menú, repite el proceso
 
             CONTEXTO DE LA LLAMADA:
             Estás llamando a {dealership_name} porque un cliente está solicitando un crédito automotriz con Nexcar Financiera.
@@ -229,44 +249,70 @@ class InvoiceValidationAgent(Agent):
         logger.info(f"detected answering machine for {self.participant.identity}")
         await self.hangup()
 
+    @function_tool()
+    async def send_dtmf_code(
+        self,
+        ctx: RunContext,
+        code: Annotated[int, "DTMF code to send (0-9)"],
+    ):
+        """Utiliza esta herramienta para navegar menús IVR automáticos. Envía un tono DTMF cuando escuches opciones como 'presione 1 para ventas'.
 
-async def save_call_transcript(session: AgentSession, metadata: dict, room_name: str):
-    """Save the call transcript to the database after call ends and trigger next steps"""
+        Args:
+            code: El número a presionar (0-9)
+        """
+        current_time = time.time()
+
+        # 3-second cooldown between DTMF presses to avoid rapid-fire presses
+        if current_time - ctx.session.userdata.last_dtmf_press < 3:
+            logger.warning("DTMF cooldown active, skipping press")
+            return "Esperando antes de presionar otra opción..."
+
+        logger.info(f"Sending DTMF code: {code}")
+
+        try:
+            # Update last press time
+            ctx.session.userdata.last_dtmf_press = current_time
+
+            # Send DTMF tone
+            await ctx.session.room.local_participant.publish_dtmf(
+                code=code,
+                digit=str(code)
+            )
+
+            logger.info(f"✅ DTMF code {code} sent successfully")
+            return f"Opción {code} seleccionada. Esperando respuesta..."
+
+        except Exception as e:
+            logger.error(f"❌ Error sending DTMF code: {e}")
+            return f"Error al seleccionar opción {code}"
+
+
+async def save_call_transcript(session: AgentSession, metadata: dict, room_name: str, userdata: UserData):
+    """Save the call transcript and recording to the database after call ends"""
     try:
         if not supabase:
             logger.error("Supabase client not initialized")
             return
 
-        # Get the full transcript from session.chat_ctx (as per LiveKit docs)
+        # Get the full transcript from session.history (proper LiveKit way)
         transcript_parts = []
+        history_dict = session.history.to_dict()
 
-        if hasattr(session, 'chat_ctx') and session.chat_ctx:
-            # Extract messages from chat context
-            for message in session.chat_ctx.messages:
-                role = message.role
+        for message in history_dict.get("messages", []):
+            role = message.get("role", "")
+            content = message.get("content", "")
 
-                # Skip system messages
-                if role == 'system':
-                    continue
+            # Skip system messages
+            if role == "system":
+                continue
 
-                # Get content - handle both string and list of content items
-                content = ""
-                if isinstance(message.content, str):
-                    content = message.content
-                elif isinstance(message.content, list):
-                    # Join all text content items
-                    content = " ".join([
-                        item.text if hasattr(item, 'text') else str(item)
-                        for item in message.content
-                    ])
-
-                # Format role name
-                role_name = "Agent" if role == "assistant" else "Dealership"
-                transcript_parts.append(f"{role_name}: {content}")
+            # Format role name
+            role_name = "Agent" if role == "assistant" else "Dealership"
+            transcript_parts.append(f"{role_name}: {content}")
 
         full_transcript = "\n".join(transcript_parts)
 
-        logger.info(f"Saving transcript for room {room_name}: {len(full_transcript)} characters")
+        logger.info(f"Saving transcript for room {room_name}: {len(full_transcript)} characters, {len(transcript_parts)} parts")
 
         validation_id = metadata.get("validationId")
         dealership_id = metadata.get("dealershipId")
@@ -281,15 +327,21 @@ async def save_call_transcript(session: AgentSession, metadata: dict, room_name:
             "dealership_id": dealership_id,
             "room_name": room_name,
             "full_transcript": full_transcript,
+            "transcript_json": json.dumps(history_dict),  # Full history as JSON
             "call_ended_at": call_ended_at,
             "email_collected": collected_email,
             "call_outcome": "success" if collected_email else "failed",
+            "recording_url": userdata.egress_id,  # Store egress/recording ID
         }
 
+        logger.info(f"Attempting to save call data to Supabase: validation_id={validation_id}, room={room_name}")
         result = supabase.table("calls").insert(call_data).execute()
 
         if result.data:
-            logger.info(f"✅ Call transcript saved successfully: {result.data[0]['id']}")
+            logger.info(f"✅ Call transcript saved successfully to database: {result.data[0].get('id', 'unknown')}")
+            logger.info(f"   - Transcript length: {len(full_transcript)} chars")
+            logger.info(f"   - Recording ID: {userdata.egress_id}")
+            logger.info(f"   - Email collected: {collected_email}")
 
             # Update validation status to ENDED_CALL for later processing
             update_result = supabase.table("validations").update({
@@ -302,10 +354,12 @@ async def save_call_transcript(session: AgentSession, metadata: dict, room_name:
             else:
                 logger.error(f"❌ Failed to update validation status for: {validation_id}")
         else:
-            logger.error("Failed to save call transcript")
+            logger.error(f"❌ Failed to save call transcript - no data returned from Supabase")
+            logger.error(f"   - Call data attempted: {json.dumps(call_data, indent=2)}")
 
     except Exception as e:
         logger.error(f"❌ Error saving call transcript: {e}")
+        logger.exception("Full traceback:")
 
 
 async def entrypoint(ctx: JobContext):
@@ -327,6 +381,36 @@ async def entrypoint(ctx: JobContext):
     vin = invoice_data.get("vin", "N/A")
     needs_email = metadata.get("needsEmail", True)
 
+    # Initialize userdata to track DTMF and transcripts
+    userdata = UserData()
+
+    # Create agent first (needed for session reference in callback)
+    agent = InvoiceValidationAgent(
+        dealership_name=dealership_name,
+        invoice_number=invoice_number,
+        customer_name=customer_name,
+        vin=vin,
+        needs_email=needs_email,
+        metadata=metadata,
+    )
+
+    # Create session (will be used in callback)
+    session = AgentSession(
+        turn_detection=MultilingualModel(),
+        vad=silero.VAD.load(),
+        stt=openai.STT(model="gpt-4o-mini-transcribe"),
+        tts=cartesia.TTS(model="sonic-2", voice="5c5ad5e7-1020-476b-8b91-fdcbe9cc313c"),
+        llm=google.LLM(model="gemini-2.0-flash-exp",),
+        userdata=userdata,  # Pass userdata to session
+    )
+
+    # Register callback to save transcript when session ends (BEFORE connecting)
+    async def write_transcript():
+        logger.info("Call ended, saving transcript and recording to database...")
+        await save_call_transcript(session, metadata, ctx.room.name, userdata)
+
+    ctx.add_shutdown_callback(write_transcript)
+
     # Step 1: Connect to the room (as per LiveKit docs)
     logger.info("Connecting to room...")
     await ctx.connect()
@@ -346,6 +430,26 @@ async def entrypoint(ctx: JobContext):
                 )
             )
             logger.info("Call answered successfully")
+
+            # Start track composite egress to record the call
+            try:
+                logger.info("Starting track composite egress for recording...")
+                egress_request = api.TrackCompositeEgressRequest(
+                    room_name=ctx.room.name,
+                    audio_only=True,  # Audio only for phone calls
+                    file_outputs=[
+                        api.EncodedFileOutput(
+                            file_type=api.EncodedFileType.MP4,
+                            filepath=f"{ctx.room.name}.mp4",
+                        )
+                    ],
+                )
+                egress_response = await ctx.api.egress.start_track_composite_egress(egress_request)
+                userdata.egress_id = egress_response.egress_id
+                logger.info(f"✅ Egress started: {egress_response.egress_id}")
+            except Exception as e:
+                logger.error(f"❌ Failed to start egress: {e}")
+
         except api.TwirpError as e:
             logger.error(
                 f"error creating SIP participant: {e.message}, "
@@ -355,25 +459,7 @@ async def entrypoint(ctx: JobContext):
             ctx.shutdown()
             return
 
-    # Step 3: Create the invoice validation agent with actual metadata
-    agent = InvoiceValidationAgent(
-        dealership_name=dealership_name,
-        invoice_number=invoice_number,
-        customer_name=customer_name,
-        vin=vin,
-        needs_email=needs_email,
-        metadata=metadata,
-    )
-
-    # Step 4: Start agent session (after SIP participant is connected)
-    session = AgentSession(
-        turn_detection=MultilingualModel(),
-        vad=silero.VAD.load(),
-        stt=openai.STT(model="gpt-4o-mini-transcribe"),
-        tts=cartesia.TTS(model="sonic-2", voice="5c5ad5e7-1020-476b-8b91-fdcbe9cc313c"),
-        llm=google.LLM(model="gemini-2.0-flash-exp",),
-    )
-
+    # Step 3: Start the agent session
     await session.start(
         agent=agent,
         room=ctx.room,
@@ -391,13 +477,6 @@ async def entrypoint(ctx: JobContext):
     # For outbound calls, wait for recipient to speak first
     # Agent will automatically respond after recipient's turn ends
     # (Do NOT call generate_reply for outbound calls)
-
-    # Register callback to save transcript when session ends (as per LiveKit docs)
-    async def write_transcript():
-        logger.info("Call ended, saving transcript...")
-        await save_call_transcript(session, metadata, ctx.room.name)
-
-    ctx.add_shutdown_callback(write_transcript)
 
 
 if __name__ == "__main__":

@@ -237,16 +237,25 @@ async def save_call_transcript(session: AgentSession, metadata: dict, room_name:
             logger.error("Supabase client not initialized")
             return
 
-        # Get the full transcript from the session
-        # The session stores all conversation messages
+        # Get the full transcript from session.history (as per LiveKit docs)
         transcript_parts = []
 
-        # Get chat context which contains the conversation history
-        if hasattr(session, 'chat_ctx') and session.chat_ctx:
-            for msg in session.chat_ctx.messages:
-                role = "Agent" if msg.role == "assistant" else "Dealership"
-                content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                transcript_parts.append(f"{role}: {content}")
+        if hasattr(session, 'history') and session.history:
+            # Convert history to readable transcript format
+            history_dict = session.history.to_dict()
+
+            # Extract messages from history
+            for item in history_dict.get('messages', []):
+                role = item.get('role', 'unknown')
+                content = item.get('content', '')
+
+                # Skip system messages
+                if role == 'system':
+                    continue
+
+                # Format role name
+                role_name = "Agent" if role == "assistant" else "Dealership"
+                transcript_parts.append(f"{role_name}: {content}")
 
         full_transcript = "\n".join(transcript_parts)
 
@@ -267,7 +276,7 @@ async def save_call_transcript(session: AgentSession, metadata: dict, room_name:
             "full_transcript": full_transcript,
             "call_ended_at": call_ended_at,
             "email_collected": collected_email,
-            "call_outcome": "success" if collected_email else "no_email",
+            "call_outcome": "success" if collected_email else "failed",
         }
 
         result = supabase.table("calls").insert(call_data).execute()
@@ -275,19 +284,16 @@ async def save_call_transcript(session: AgentSession, metadata: dict, room_name:
         if result.data:
             logger.info(f"✅ Call transcript saved successfully: {result.data[0]['id']}")
 
-            # Process based on whether email was collected
-            if collected_email:
-                # Update validation with collected email
-                update_result = supabase.table("validations").update({
-                    "agency_email": collected_email,
-                    "updated_at": datetime.utcnow().isoformat()
-                }).eq("id", validation_id).execute()
+            # Update validation status to ENDED_CALL for later processing
+            update_result = supabase.table("validations").update({
+                "status": "ENDED_CALL",
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("id", validation_id).execute()
 
-                if update_result.data:
-                    logger.info(f"✅ Validation updated with email: {collected_email}")
+            if update_result.data:
+                logger.info(f"✅ Validation status updated to ENDED_CALL for validation: {validation_id}")
             else:
-                # No email collected - just log it
-                logger.info("⚠️ No email collected during call")
+                logger.error(f"❌ Failed to update validation status for: {validation_id}")
         else:
             logger.error("Failed to save call transcript")
 
@@ -379,15 +385,12 @@ async def entrypoint(ctx: JobContext):
     # Agent will automatically respond after recipient's turn ends
     # (Do NOT call generate_reply for outbound calls)
 
-    # Wait for the session to end, then save the transcript
-    try:
-        await session.aclose()
-    except Exception as e:
-        logger.error(f"Session error: {e}")
-    finally:
-        # Save transcript after call ends
+    # Register callback to save transcript when session ends (as per LiveKit docs)
+    async def write_transcript():
         logger.info("Call ended, saving transcript...")
         await save_call_transcript(session, metadata, ctx.room.name)
+
+    ctx.add_shutdown_callback(write_transcript)
 
 
 if __name__ == "__main__":

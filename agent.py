@@ -237,21 +237,28 @@ async def save_call_transcript(session: AgentSession, metadata: dict, room_name:
             logger.error("Supabase client not initialized")
             return
 
-        # Get the full transcript from session.history (as per LiveKit docs)
+        # Get the full transcript from session.chat_ctx (as per LiveKit docs)
         transcript_parts = []
 
-        if hasattr(session, 'history') and session.history:
-            # Convert history to readable transcript format
-            history_dict = session.history.to_dict()
-
-            # Extract messages from history
-            for item in history_dict.get('messages', []):
-                role = item.get('role', 'unknown')
-                content = item.get('content', '')
+        if hasattr(session, 'chat_ctx') and session.chat_ctx:
+            # Extract messages from chat context
+            for message in session.chat_ctx.messages:
+                role = message.role
 
                 # Skip system messages
                 if role == 'system':
                     continue
+
+                # Get content - handle both string and list of content items
+                content = ""
+                if isinstance(message.content, str):
+                    content = message.content
+                elif isinstance(message.content, list):
+                    # Join all text content items
+                    content = " ".join([
+                        item.text if hasattr(item, 'text') else str(item)
+                        for item in message.content
+                    ])
 
                 # Format role name
                 role_name = "Agent" if role == "assistant" else "Dealership"
